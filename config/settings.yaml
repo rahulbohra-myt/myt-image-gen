@@ -1,0 +1,10 @@
+default_model: nano_banana_pro
+model_string: gemini-3-pro-image
+refiner_model_string: gemini-2.5-flash
+max_refinement_questions: 4
+default_count: 3
+default_aspect_ratio: "1:1"
+default_resolution: "2K"
+output_dir: output
+reference_dir: reference-images
+manifest_path: output/manifest.json

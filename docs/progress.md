@@ -1,0 +1,38 @@
+# Progress
+
+## Status: Phase 1 (v1 CLI) complete — generate, list-refs, history all built and verified
+
+### Done
+
+- Project scaffolded: folders, requirements.txt, .env, .gitignore (created 2026-07-08 — was previously referenced as done in these notes but didn't actually exist)
+- Dependencies installed: typer, rich, google-genai, pyyaml, python-dotenv, pillow, pytest
+- CLAUDE.md + decisions.md established; full design interview completed 2026-07-08 (see decisions.md "Prompting, Reliability & CLI Behavior")
+- providers/base.py: BaseImageProvider abstract class (validate_params, build_output_path with collision suffixing, abstract generate()); GenerationResult carries a list of per-image ImageOutcome (success/path/error), with status/output_paths/errors properties yielding "success"/"partial"/"failed"
+- **Phase 1a vertical slice verified against the real API 2026-07-08**: confirmed `client.models.generate_content()` end-to-end (real photorealistic image generated, correct filename, correct manifest entry). SDK research notes in decisions.md "Phase 1 Implementation Notes". Model string `gemini-3-pro-image` worked on first try, no `-preview` suffix needed.
+- **Phase 1b complete 2026-07-08** — all decided features layered onto the proven slice:
+  - Brand-guide auto-injection (`main.py::_assemble_prompt`) — verified logic correct; `reference-images/brand-guide.md` was empty at the time but now has real content (see below)
+  - Retry/backoff (2s/4s/8s, max 3, on 429/5xx/timeout) in `providers/nano_banana_pro.py::_call_with_retry` + `_is_retryable`
+  - Reference image 14-cap truncation + console warning (`main.py::_collect_reference_images`)
+  - Cost guardrail: `--count > 10` rejected before any API call
+  - Rich console UX: per-image spinner, retry visibility, summary table, color-coded status — table titles print as plain lines above tables (not `Table(title=...)`) and `history`'s Timestamp/Outputs columns use `overflow="fold"` instead of ellipsis truncation, both to sidestep a Windows console encoding quirk (see decisions.md)
+  - `list-refs` and `history` commands built and manually verified
+  - Manifest schema extended with `user_prompt` (raw text) alongside `prompt` (full assembled) — see decisions.md
+  - 18 pytest tests passing: manifest I/O, collision-suffix naming, param validation, GenerationResult status logic, retry/backoff behavior (`tests/`)
+- **`reference-images/brand-guide.md` populated 2026-07-09** with real MYT brand content (name convention, representation guidance, actual brand color palette, favored settings, avoid-list) — see decisions.md "Brand Guide Content" for full detail. Prompt injection now has real effect.
+- **Two real campaign folders added 2026-07-10**: `individual-yoga-poses` (single-pose reference cards, deduped from 27→23 files) and `yoga-excercises-infographics` (multi-pose composite layouts, mixed sources). Documented folder purpose/type in decisions.md.
+- **`generate` validated end-to-end against real campaign content 2026-07-10** (previously only smoke-tested against throwaway `test-campaign`). Surfaced and fixed a real brand-guide gap: the model fabricates its own MyYogaTeacher logo/icon when asked for "branded" content — new brand-guide.md rule bans logo/icon rendering entirely (plain text only).
+- **Prompt refinement step built 2026-07-10** (`--refine/--no-refine`, on by default): `providers/prompt_refiner.py` runs a text-only, two-call flow (clarifying questions with recommended defaults → paragraph synthesis) via a separate cheap text model (`refiner_model_string: gemini-2.5-flash`) before the raw prompt reaches the expensive image model. Fails open on any API error. New `utils/retry.py` extracts the retry/backoff wrapper, now shared between the image provider and the refiner. Manifest gains `refined_prompt`/`refinement_qa`. 8 new tests (`tests/test_prompt_refiner.py`, `tests/test_nano_banana_pro.py`), `tests/test_retry.py` retargeted — 26 tests passing total. See decisions.md for full design rationale and a process note about a subagent's unverified live-API-call claim during planning.
+
+- **`docs/prompting-guide.md` added 2026-07-10** — keyword/phrasing checklist for writing unambiguous, on-brand prompts (medium, lighting, camera/lens, hex colors, quantity precision, text rendering, negatives, reference-image usage). Wired into `providers/prompt_refiner.py::synthesize_prompt` (applied as phrasing conventions during synthesis, not fed into the questions call — see decisions.md for the reasoning). 28 tests passing total.
+
+- **`--refine` end-to-end verified 2026-07-10** — 3 real generations against `individual-yoga-poses` for a sciatica-pain Meta ad campaign (desk-work creative x2 attire variants, toddler-lifting creative in 16:9). Confirmed the prompting-guide synthesis integration works in practice (refined prompts picked up medium/lighting/lens/negatives automatically). Surfaced a second fabricated-brand-asset variant — model invented a "MyYogaTeacher"-labeled yoga mat prop unprompted — brand-guide.md's no-logo rule extended to cover fabricated branded merchandise/props (see decisions.md).
+- **Six-pose lower-back-pain infographic completed 2026-07-11** — new `lower-back-pain-poses` campaign folder, started empty/text-only. Took 4 generation attempts to land on a final asset: fixed a multi-figure color-consistency brand-guide gap and a pose-accuracy issue (Supine Spinal Twist needed a different camera angle than the other five poses to read correctly). Final: `output/lower-back-pain-poses_20260710-1855_1.png`. Also surfaced that the refiner-Q&A-relay-to-foreground technique (probe questions, then pipe real answers into the live call) is unreliable since the live call can generate a different question set — see decisions.md process note.
+- **All four generation attempts promoted to reference images** — `reference-images/lower-back-pain-poses/` now contains all 4 output files as the campaign's own style anchor (no longer empty/text-only). `brand-guide.md` gained an "Established Pose-Grid Infographic Style" section documenting the proven recipe, so future `generate` calls against this campaign (or similar pose-grid infographics) auto-collect these as references and inherit the style guidance.
+
+### Next
+
+- Clean up or repurpose the `test-campaign` throwaway folder and its manifest/output entries once real usage begins
+
+### Phase 2 (deferred)
+
+- Multi-turn conversational editing (session/parent-generation concept, new CLI command)

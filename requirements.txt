@@ -1,0 +1,8 @@
+typer
+rich
+google-genai
+pydantic
+pyyaml
+python-dotenv
+pillow
+pytest
