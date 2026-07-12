@@ -1,5 +1,6 @@
 """Typer CLI entry point — generate, list-refs, and history commands."""
 
+import json
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -81,6 +82,50 @@ def _collect_reference_images(campaign_dir: Path) -> list[Path]:
     return images
 
 
+def _resolve_campaign_refs(campaign: str, refs: str | None, settings: dict) -> list[Path]:
+    """Validate the campaign folder exists and resolve the reference-image list; shared by
+    generate and refine-questions so both see identical campaign/refs semantics."""
+    reference_dir = Path(settings["reference_dir"]) / campaign
+    if not reference_dir.exists():
+        console.print(
+            f"[red]Campaign '{campaign}' not found at {normalize_path(reference_dir)}/. "
+            f"Create the folder first (it can be empty) or check for a typo.[/red]"
+        )
+        raise typer.Exit(code=1)
+    if refs:
+        return [reference_dir / name.strip() for name in refs.split(",")]
+    return _collect_reference_images(reference_dir)
+
+
+def _load_answers_file(path: Path) -> list[dict]:
+    """Load and validate a --answers-file JSON (same shape refine-questions --out produces,
+    with an optional per-item "answer" filled in). Missing/empty "answer" falls back to
+    "recommended_answer", mirroring the interactive Enter-to-accept-default behavior.
+    Raises ValueError on any structural problem; no length cap against
+    max_refinement_questions since that cap only bounds the live question-generation call,
+    which this path skips entirely."""
+    if not path.exists():
+        raise ValueError(f"Answers file not found: {normalize_path(path)}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Answers file is not valid JSON: {e}") from e
+    if not isinstance(raw, list):
+        raise ValueError("Answers file must contain a JSON array of question objects.")
+
+    qa: list[dict] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict) or not isinstance(item.get("question"), str) or not isinstance(
+            item.get("recommended_answer"), str
+        ):
+            raise ValueError(f"Answers file item #{i} is missing required 'question'/'recommended_answer' string keys.")
+        answer = item.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            answer = item["recommended_answer"]
+        qa.append({"question": item["question"], "recommended_answer": item["recommended_answer"], "answer": answer})
+    return qa
+
+
 @dataclass
 class RefinementResult:
     """Outcome of the interactive refinement step, ready to feed into _assemble_prompt / the manifest."""
@@ -91,39 +136,58 @@ class RefinementResult:
     aborted: bool = False
 
 
-def _refine_prompt(raw_prompt: str, campaign: str, reference_images: list[Path], settings: dict) -> RefinementResult:
+def _refine_prompt(
+    raw_prompt: str,
+    campaign: str,
+    reference_images: list[Path],
+    settings: dict,
+    answers_qa: list[dict] | None = None,
+) -> RefinementResult:
     """Ask clarifying questions (with recommended defaults) and synthesize a polished prompt.
+
+    If answers_qa is given (from --answers-file), the live clarifying-questions call and the
+    interactive Prompt.ask/Confirm.ask loop are both skipped — the live call can no longer
+    generate a different question set than an earlier probe, because it never generates
+    questions at all in this path (fixes the drift documented in docs/decisions.md's
+    2026-07-11 entry).
 
     Never raises — any refiner API failure prints a warning and falls back to raw_prompt
     so refinement can never block or crash a generate call.
     """
-    console.print(f"\n[bold cyan]Refining prompt for '{campaign}'...[/bold cyan]")
     refiner = PromptRefiner(model_name=settings["refiner_model_string"])
-    brand_guide = _load_brand_guide()
-    max_questions = settings["max_refinement_questions"]
 
-    try:
-        with console.status("[bold cyan]Checking prompt for ambiguities...[/bold cyan]"):
-            questions = refiner.generate_questions(
-                user_prompt=raw_prompt,
-                campaign=campaign,
-                reference_filenames=[p.name for p in reference_images],
-                brand_guide=brand_guide,
-                max_questions=max_questions,
-            )
-    except Exception as e:
-        console.print(f"[yellow]Warning: prompt refinement unavailable ({e}). Continuing with your original prompt.[/yellow]")
-        return RefinementResult(final_prompt=raw_prompt)
+    if answers_qa is not None:
+        console.print(f"\n[bold cyan]Refining prompt for '{campaign}' from supplied answers (non-interactive)...[/bold cyan]")
+        if not answers_qa:
+            console.print("[green]No clarifying questions in the answers file — using original prompt as-is.[/green]")
+            return RefinementResult(final_prompt=raw_prompt)
+        qa = answers_qa
+    else:
+        console.print(f"\n[bold cyan]Refining prompt for '{campaign}'...[/bold cyan]")
+        brand_guide = _load_brand_guide()
+        max_questions = settings["max_refinement_questions"]
+        try:
+            with console.status("[bold cyan]Checking prompt for ambiguities...[/bold cyan]"):
+                questions = refiner.generate_questions(
+                    user_prompt=raw_prompt,
+                    campaign=campaign,
+                    reference_filenames=[p.name for p in reference_images],
+                    brand_guide=brand_guide,
+                    max_questions=max_questions,
+                )
+        except Exception as e:
+            console.print(f"[yellow]Warning: prompt refinement unavailable ({e}). Continuing with your original prompt.[/yellow]")
+            return RefinementResult(final_prompt=raw_prompt)
 
-    if not questions:
-        console.print("[green]Prompt looks sufficiently detailed — no clarifying questions needed.[/green]")
-        return RefinementResult(final_prompt=raw_prompt)
+        if not questions:
+            console.print("[green]Prompt looks sufficiently detailed — no clarifying questions needed.[/green]")
+            return RefinementResult(final_prompt=raw_prompt)
 
-    console.print(f"\n[bold]{len(questions)} clarifying question(s) — press Enter to accept the recommended answer.[/bold]")
-    qa: list[dict] = []
-    for i, q in enumerate(questions, start=1):
-        answer = Prompt.ask(f"[cyan]{i}. {q.question}[/cyan]", default=q.recommended_answer)
-        qa.append({"question": q.question, "recommended_answer": q.recommended_answer, "answer": answer})
+        console.print(f"\n[bold]{len(questions)} clarifying question(s) — press Enter to accept the recommended answer.[/bold]")
+        qa = []
+        for i, q in enumerate(questions, start=1):
+            answer = Prompt.ask(f"[cyan]{i}. {q.question}[/cyan]", default=q.recommended_answer)
+            qa.append({"question": q.question, "recommended_answer": q.recommended_answer, "answer": answer})
 
     try:
         with console.status("[bold cyan]Synthesizing refined prompt...[/bold cyan]"):
@@ -136,9 +200,11 @@ def _refine_prompt(raw_prompt: str, campaign: str, reference_images: list[Path],
 
     console.print("\n[bold]Refined prompt:[/bold]")
     console.print(polished)
-    if not Confirm.ask("\nUse this refined prompt for generation?", default=True):
-        console.print("[yellow]Generation cancelled — no image was generated.[/yellow]")
-        return RefinementResult(final_prompt=raw_prompt, refined_prompt=polished, qa=qa, aborted=True)
+
+    if answers_qa is None:
+        if not Confirm.ask("\nUse this refined prompt for generation?", default=True):
+            console.print("[yellow]Generation cancelled — no image was generated.[/yellow]")
+            return RefinementResult(final_prompt=raw_prompt, refined_prompt=polished, qa=qa, aborted=True)
 
     return RefinementResult(final_prompt=polished, refined_prompt=polished, qa=qa)
 
@@ -152,10 +218,20 @@ def generate(
     aspect_ratio: str | None = typer.Option(None, "--aspect-ratio", help="Output aspect ratio."),
     resolution: str | None = typer.Option(None, "--resolution", help="Output resolution: 1K, 2K, or 4K."),
     refine: bool = typer.Option(True, "--refine/--no-refine", help="Run AI prompt refinement (clarifying questions + synthesis) before generating. On by default."),
+    answers_file: Path | None = typer.Option(
+        None,
+        "--answers-file",
+        help="Path to a JSON answers file (same schema as refine-questions --out) to use instead "
+        "of asking clarifying questions interactively. Incompatible with --no-refine.",
+    ),
 ) -> None:
     """Generate images for a campaign and log the attempt to the manifest."""
     if not os.getenv("GEMINI_API_KEY"):
         console.print("[red]Error: GEMINI_API_KEY is not set. Add it to .env before generating images.[/red]")
+        raise typer.Exit(code=1)
+
+    if answers_file and not refine:
+        console.print("[red]Error: --answers-file cannot be combined with --no-refine.[/red]")
         raise typer.Exit(code=1)
 
     settings = _load_settings()
@@ -163,25 +239,22 @@ def generate(
     aspect_ratio = aspect_ratio or settings["default_aspect_ratio"]
     resolution = resolution or settings["default_resolution"]
 
+    answers_qa: list[dict] | None = None
+    if answers_file:
+        try:
+            answers_qa = _load_answers_file(answers_file)
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            raise typer.Exit(code=1)
+
     if count > MAX_COUNT:
         console.print(f"[red]Error: --count {count} exceeds the maximum of {MAX_COUNT}.[/red]")
         raise typer.Exit(code=1)
 
-    reference_dir = Path(settings["reference_dir"]) / campaign
-    if not reference_dir.exists():
-        console.print(
-            f"[red]Campaign '{campaign}' not found at {normalize_path(reference_dir)}/. "
-            f"Create the folder first (it can be empty) or check for a typo.[/red]"
-        )
-        raise typer.Exit(code=1)
-
-    if refs:
-        reference_images = [reference_dir / name.strip() for name in refs.split(",")]
-    else:
-        reference_images = _collect_reference_images(reference_dir)
+    reference_images = _resolve_campaign_refs(campaign, refs, settings)
 
     if refine:
-        refinement = _refine_prompt(prompt, campaign, reference_images, settings)
+        refinement = _refine_prompt(prompt, campaign, reference_images, settings, answers_qa=answers_qa)
         if refinement.aborted:
             raise typer.Exit(code=0)
     else:
@@ -238,6 +311,61 @@ def generate(
 
     color = STATUS_COLORS.get(result.status, "white")
     console.print(f"Status: [{color}]{result.status}[/{color}]")
+
+
+@app.command(name="refine-questions")
+def refine_questions(
+    prompt: str = typer.Option(..., "--prompt", help="Prompt text to check for ambiguities."),
+    campaign: str = typer.Option(..., "--campaign", help="Campaign name, maps to reference-images/<campaign>/."),
+    refs: str | None = typer.Option(None, "--refs", help="Comma-separated reference image filenames. Defaults to all images in the campaign folder."),
+    out: Path | None = typer.Option(None, "--out", help="Write the resulting question set as JSON to this path, for later use with generate --answers-file."),
+) -> None:
+    """Ask the refiner's clarifying questions for a prompt without generating images — the
+    non-interactive first half of the two-step refinement flow. Pair with
+    generate --answers-file once questions are answered."""
+    if not os.getenv("GEMINI_API_KEY"):
+        console.print("[red]Error: GEMINI_API_KEY is not set. Add it to .env before refining prompts.[/red]")
+        raise typer.Exit(code=1)
+
+    settings = _load_settings()
+    reference_images = _resolve_campaign_refs(campaign, refs, settings)
+
+    console.print(f"\n[bold cyan]Checking prompt for ambiguities — '{campaign}'...[/bold cyan]")
+    refiner = PromptRefiner(model_name=settings["refiner_model_string"])
+    brand_guide = _load_brand_guide()
+    max_questions = settings["max_refinement_questions"]
+
+    try:
+        with console.status("[bold cyan]Checking prompt for ambiguities...[/bold cyan]"):
+            questions = refiner.generate_questions(
+                user_prompt=prompt,
+                campaign=campaign,
+                reference_filenames=[p.name for p in reference_images],
+                brand_guide=brand_guide,
+                max_questions=max_questions,
+            )
+    except Exception as e:
+        console.print(f"[red]Error: prompt refinement failed ({e}).[/red]")
+        raise typer.Exit(code=1)
+
+    qa_payload = [{"question": q.question, "recommended_answer": q.recommended_answer} for q in questions]
+
+    if not questions:
+        console.print("[green]Prompt looks sufficiently detailed — no clarifying questions needed.[/green]")
+    else:
+        console.print(f"\n[bold]{len(questions)} clarifying question(s):[/bold]")
+        table = Table()
+        table.add_column("#")
+        table.add_column("Question")
+        table.add_column("Recommended answer")
+        for i, q in enumerate(questions, start=1):
+            table.add_row(str(i), q.question, q.recommended_answer)
+        console.print(table)
+
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(qa_payload, indent=2), encoding="utf-8")
+        console.print(f"\n[green]Wrote {len(qa_payload)} question(s) to {normalize_path(out)}[/green]")
 
 
 @app.command(name="list-refs")

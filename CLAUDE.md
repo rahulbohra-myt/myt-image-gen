@@ -57,6 +57,18 @@ provider methods themselves raise — main.py's `_refine_prompt` decides
 the fallback), prints a warning, and falls back to the user's original
 raw prompt. Refinement must never block or crash a `generate` call.
 
+**Non-interactive two-step variant**: the interactive question/answer loop
+above assumes a human typing directly into the terminal. When an AI agent
+drives `generate` on the user's behalf — relaying clarifying questions to
+the user via chat and feeding answers back — the live `generate_questions()`
+call is non-deterministic, so a separate probe call's questions can differ
+from the live call's questions, causing answers to land on the wrong
+question. `refine-questions` (a standalone command, see CLI Commands) asks
+the questions once and can persist them to a JSON file; `generate
+--answers-file <path>` then consumes that exact file, skipping the live
+clarifying-questions call and the interactive prompts entirely, so the two
+steps can never drift apart. See docs/decisions.md's 2026-07-12 entry.
+
 ## File Structure
 myt-image-gen/
 ├── main.py                     # Typer app — CLI entry point, defines subcommands
@@ -88,6 +100,8 @@ myt-image-gen/
   - `--count` defaults to 3 (config default), `--aspect-ratio` and `--resolution` fall back to config/settings.yaml if omitted
   - Campaign folder with zero reference images is valid — falls back to text-only generation
   - `--refine/--no-refine` (default: `--refine`) — before generation, runs a text-only prompt-refinement step using a separate, cheaper Gemini text model (`refiner_model_string`). It reads the raw prompt, campaign name, reference image filenames, and brand-guide.md, and asks up to `max_refinement_questions` clarifying questions (each with a recommended default — press Enter to accept). If the prompt is already unambiguous, zero questions are asked and refinement is skipped. Otherwise a second lightweight call synthesizes the prompt + your answers into one polished paragraph, shown to you for confirmation (default yes) before it's brand-guide-assembled and sent to the image model — decline to cancel the call with no image API call made and no manifest entry. Any refinement API failure prints a warning and falls back to your original prompt; it never blocks generation. Use `--no-refine` to skip entirely.
+  - `--answers-file <path>` — skips the interactive clarifying-question loop and the confirmation gate entirely, using a pre-answered JSON file instead (same schema `refine-questions --out` produces, with an `"answer"` filled in per item — missing/blank answers fall back to `recommended_answer`). Meant for non-interactive/agent-driven use where a separate `refine-questions` call already captured the exact question set. Incompatible with `--no-refine` (hard error). Not enforced: the file isn't checked against the current `--prompt`/`--campaign` for consistency — that's on the caller.
+- `python main.py refine-questions --prompt "..." --campaign postpartum-yoga [--refs file1.png,file2.png] [--out questions.json]` — runs only the clarifying-questions half of prompt refinement (no image generation, no manifest entry) and prints the results; with `--out`, writes them as a JSON array (`[{"question": "...", "recommended_answer": "..."}, ...]`) for later use with `generate --answers-file`. Exists specifically so the exact question set can be captured once and reused, instead of relying on a second live call that might return different questions (see Prompt Refinement section above).
 - `python main.py list-refs [--campaign postpartum-yoga]` — lists available campaign folders, or files within one campaign, so Rahul can check what's available before generating
 - `python main.py history [--campaign postpartum-yoga] [--limit 10]` — reads manifest.json, shows past generations as a Rich table (timestamp, campaign, prompt preview, output files, status)
 
